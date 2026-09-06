@@ -591,6 +591,14 @@ impl SessionGraph {
             .iter()
             .map(|node| node.finding.risk_id.clone())
             .collect::<Vec<_>>();
+        if !finding_ids.is_empty() {
+            eprintln!(
+                "[COMMIT] agent={} chunk={} ids=[{}]",
+                agent_id.to_string(),
+                attempt_chunk,
+                finding_ids.join(",")
+            );
+        }
         {
             let attempt = state
                 .review_attempts
@@ -605,6 +613,88 @@ impl SessionGraph {
             state.reviewed_by.entry(attempt_chunk.clone()).or_default(),
             agent_id,
         );
+        let affected = deduplicate_strings(&affected);
+        let graph_version = bump_versions(&mut state, affected.clone());
+        Ok(Self::build_graph_commit(&state, graph_version, &affected))
+    }
+
+    /// 原子提交“部分完成”的审查结果：只把非截断的真实 finding 写入图，
+    /// 同时把该尝试标记为 Failed（保留截断信号，且不计入 reviewed_by）。
+    ///
+    /// 用于一条 clause 同时产出截断与合法 finding 的场景（例如主扫描成功、
+    /// 自适应补充扫描截断）。合法 finding 照常入图，避免“列表里有、图里没有”
+    /// 的 finalize 硬失败；截断事实保留在 attempt 的 error_code/error_message 上，
+    /// 供盲点补扫与前端“审查不完整”提示使用。
+    pub fn commit_review_result_partial(
+        &self,
+        attempt_id: &str,
+        good_findings: &[RiskFinding],
+        error_code: ReviewAttemptErrorCode,
+        error_message: &str,
+    ) -> Result<GraphCommit, String> {
+        // 只规范化非截断、非 no_risk 的合法子集；空子集属于纯截断，应回退 fail_review_attempt。
+        let nodes = normalize_provisional_findings(good_findings)?;
+        if nodes.is_empty() {
+            return Err("部分提交必须包含至少一个真实 finding".to_string());
+        }
+
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "SessionGraph 状态写锁已中毒".to_string())?;
+        let (agent_id, attempt_chunk) = {
+            let attempt = state
+                .review_attempts
+                .get(attempt_id)
+                .ok_or_else(|| format!("审查尝试不存在: {}", attempt_id))?;
+            if attempt.status != ReviewAttemptStatus::Started {
+                return Err(format!("审查尝试 {} 已结束，禁止重复流转", attempt_id));
+            }
+            (attempt.agent_id.clone(), attempt.chunk_id.clone())
+        };
+        Self::validate_risk_conflicts(&state, &nodes)?;
+
+        let mut affected = vec![attempt_chunk.clone()];
+        let mut affected_law_refs = Vec::new();
+        let mut changed_risk_ids = Vec::new();
+        for node in &nodes {
+            let (node_affected, node_law_refs, node_changed) =
+                Self::upsert_provisional_node_in_state(&mut state, node);
+            affected.extend(node_affected);
+            affected_law_refs.extend(node_law_refs);
+            if node_changed {
+                changed_risk_ids.push(node.finding.risk_id.clone());
+            }
+        }
+        affected.extend(Self::indexed_chunks_for_changes_in_state(
+            &state,
+            &deduplicate_strings(&changed_risk_ids),
+            &deduplicate_strings(&affected_law_refs),
+        ));
+        let finding_ids = nodes
+            .iter()
+            .map(|node| node.finding.risk_id.clone())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[COMMIT-PARTIAL] agent={} chunk={} committed=[{}] error={:?}",
+            agent_id.to_string(),
+            attempt_chunk,
+            finding_ids.join(","),
+            error_code
+        );
+        {
+            let attempt = state
+                .review_attempts
+                .get_mut(attempt_id)
+                .expect("审查尝试已在修改前验证存在");
+            attempt.status = ReviewAttemptStatus::Failed;
+            attempt.error_code = Some(error_code);
+            attempt.error_message = Some(error_message.to_string());
+            attempt.finding_ids = finding_ids;
+            attempt.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        // 失败尝试不计入 reviewed_by（与 fail_review_attempt 语义一致）：
+        // 使 BlindSpot 仍能通过 reviewed==0 把被截断条款纳入补扫。
         let affected = deduplicate_strings(&affected);
         let graph_version = bump_versions(&mut state, affected.clone());
         Ok(Self::build_graph_commit(&state, graph_version, &affected))
@@ -786,6 +876,33 @@ impl SessionGraph {
             .state
             .write()
             .map_err(|_| "SessionGraph 状态写锁已中毒".to_string())?;
+
+        // 诊断：一次性收集全部缺失 risk_id 打印到日志（不改变对外错误语义），
+        // 用于在 finalize 失败时区分“漏写模式”；随后仍按原语义逐项 fail-fast。
+        let mut missing_debug: Vec<String> = Vec::new();
+        for risk_id in &confirmed_ids {
+            if !state.risks.contains_key(risk_id) {
+                missing_debug.push(format!("confirmed:{}", risk_id));
+            }
+        }
+        for (source, target) in merged {
+            if !state.risks.contains_key(source) {
+                missing_debug.push(format!("merged_source:{}", source));
+            }
+            if !state.risks.contains_key(target) {
+                missing_debug.push(format!("merged_target:{}", target));
+            }
+        }
+        for source in rejected.keys() {
+            if !state.risks.contains_key(source) {
+                missing_debug.push(format!("rejected_source:{}", source));
+            }
+        }
+        if !missing_debug.is_empty() {
+            missing_debug.sort();
+            missing_debug.dedup();
+            eprintln!("[FINALIZE-MISSING] {}", missing_debug.join(", "));
+        }
 
         for risk_id in &confirmed_ids {
             if !state.risks.contains_key(risk_id) {
@@ -1813,6 +1930,46 @@ mod tests {
             ReviewAttemptStatus::Failed
         );
         assert!(!snapshot.reviewed_by.contains_key("ch_001"));
+    }
+
+    #[test]
+    fn partial_commit_inserts_good_finding_and_keeps_failed_attempt_signature() {
+        let graph = SessionGraph::new();
+        graph.add_chunk(make_test_chunk("ch_001"));
+        let attempt_id = graph
+            .start_review_attempt(AgentId::FactCheck, "ch_001")
+            .expect("应创建审查尝试");
+        let good = make_test_risk("R_001", "ch_001").finding;
+
+        // 模拟：一条 clause 同时产出合法 finding 与截断条目，走部分提交。
+        graph
+            .commit_review_result_partial(
+                &attempt_id,
+                &[good.clone()],
+                ReviewAttemptErrorCode::IncompleteOutput,
+                "补充扫描截断",
+            )
+            .expect("应部分提交合法子集");
+
+        let snapshot = graph.snapshot();
+        // 1) 合法 finding 已入图（关键：finalize 不再报“不存在”）。
+        assert_eq!(snapshot.risks.len(), 1);
+        assert_eq!(snapshot.risks["R_001"].state, FindingState::Provisional);
+        // 2) 尝试仍标记 Failed，保留截断信号（供盲点补扫与前端提示）。
+        let attempt = &snapshot.review_attempts[&attempt_id];
+        assert_eq!(attempt.status, ReviewAttemptStatus::Failed);
+        assert_eq!(
+            attempt.error_code,
+            Some(ReviewAttemptErrorCode::IncompleteOutput)
+        );
+        assert_eq!(attempt.finding_ids, vec!["R_001".to_string()]);
+        // 3) 失败尝试不计入 reviewed_by（与 fail_review_attempt 一致）。
+        assert!(!snapshot.reviewed_by.contains_key("ch_001"));
+
+        // 4) 旧 bug 的端到端复现：finalize 应成功，而非“最终 finding 在工作图中不存在”。
+        let _ = graph
+            .finalize_audit(&[good], &HashMap::new(), &HashMap::new())
+            .expect("部分提交后的 finding 必须能被 finalize 引用");
     }
 
     #[test]

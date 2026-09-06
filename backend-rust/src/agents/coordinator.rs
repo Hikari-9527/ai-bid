@@ -3200,7 +3200,10 @@ impl Coordinator {
             .map(|attempt| attempt.attempt_id.clone())
             .collect::<HashSet<_>>();
 
-        // 识别候选条款：未审查 OR (≤1 Agent 审查且无风险发现)
+        // 识别候选条款：未审查 OR (≤1 Agent 审查且无风险发现)。
+        // 说明：部分提交（commit_review_result_partial）不计入 reviewed_by，
+        // 因此被截断的条款仍保持 reviewed==0，照旧会被此规则纳入补扫，无需额外按 Failed 尝试扩候选，
+        // 以免按页面序排序后挤占真正“未审查”条款的补扫预算。
         let mut candidate_ids: Vec<String> = snapshot
             .chunks
             .keys()

@@ -2682,9 +2682,42 @@ where
                                 ReviewAttemptErrorCode::IncompleteOutput => "条款审查未完整结束",
                                 _ => "条款审查失败",
                             };
-                            graph
-                                .fail_review_attempt(attempt_id, error_code, message)
-                                .map_err(anyhow::Error::msg)?;
+                            // 按 finding 粒度收口：合法（非截断、非 no_risk）子集照常入图，
+                            // 截断条目仅作为失败信号保留。避免“列表里有、图里没有”的 finalize 硬失败。
+                            let truncated_ids = findings
+                                .iter()
+                                .filter(|f| f.truncated)
+                                .map(|f| f.risk_id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let good: Vec<RiskFinding> = findings
+                                .iter()
+                                .filter(|f| !f.truncated && !f.no_risk)
+                                .cloned()
+                                .collect();
+                            let good_ids = good
+                                .iter()
+                                .map(|f| f.risk_id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            eprintln!(
+                                "[ATTEMPT-FAIL] agent={} chunk={} msg={} truncated=[{}] committed=[{}]",
+                                name, clause.chunk_id, message, truncated_ids, good_ids
+                            );
+                            if good.is_empty() {
+                                graph
+                                    .fail_review_attempt(attempt_id, error_code, message)
+                                    .map_err(anyhow::Error::msg)?;
+                            } else {
+                                graph
+                                    .commit_review_result_partial(
+                                        attempt_id,
+                                        &good,
+                                        error_code,
+                                        message,
+                                    )
+                                    .map_err(anyhow::Error::msg)?;
+                            }
                             failure_message = Some(message.to_string());
                         }
                     }
