@@ -293,14 +293,19 @@ pub fn gen_rule_id(content: &str) -> String {
     format!("rule_{}", &hash[..8])
 }
 
-/// 生成 experience_id：SHA256(risk_id + ":" + candidate_id) 前8位 + exp_ 前缀。
-/// 同风险类型下同一候选的重复导入 → 同 ID → MERGE 幂等；跨审核去重语义与候选编号一致。
-pub fn gen_experience_id(risk_id: &str, candidate_id: &str) -> String {
+/// 生成 experience_id：SHA256(risk_id + ":" + candidate_id + ":" + batch_key) 前8位 + exp_ 前缀。
+///
+/// 幂等语义：同一文档（batch_key）同风险类型同候选重投 → 同 ID → MERGE 幂等；
+/// 跨文档去重：不同 batch_key 必产生不同 ID，避免"同风险类型 + 同候选序号"跨审核撞 ID、
+/// 导致第二次审核的处置经验被 MERGE 静默丢弃。
+pub fn gen_experience_id(risk_id: &str, candidate_id: &str, batch_key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"exp:");
     hasher.update(risk_id.as_bytes());
     hasher.update(b":");
     hasher.update(candidate_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(batch_key.as_bytes());
     let hash = hex::encode(hasher.finalize());
     format!("exp_{}", &hash[..8])
 }
@@ -374,6 +379,7 @@ fn infer_dimension(risk_type: &str) -> (&'static str, &'static str, &'static str
 pub fn extract_and_dedup(
     candidates: Vec<Candidate>,
     existing_law_ids: &HashSet<String>,
+    batch_key: &str,
 ) -> Vec<EntityDecision> {
     candidates
         .into_iter()
@@ -476,9 +482,10 @@ pub fn extract_and_dedup(
             };
 
             // 每次审核必产生一条处置经验（独立 RiskExperience 节点，不依赖 case_refs）：
-            // 事实锚点 + 理由 + 建议。ID 基于 risk_id + candidate_id 稳定幂等。
+            // 事实锚点 + 理由 + 建议。ID 基于 risk_id + candidate_id + batch_key 稳定幂等
+            // （batch_key = 文档确定性标识，保证跨文档不撞 ID）。
             let risk_experience = RiskExperience {
-                experience_id: gen_experience_id(&risk.id, &cand.candidate_id),
+                experience_id: gen_experience_id(&risk.id, &cand.candidate_id, batch_key),
                 candidate_id: cand.candidate_id.clone(),
                 source_quote: cand.source_quote.clone(),
                 reason: cand.reason.clone(),
@@ -701,7 +708,7 @@ mod tests {
             confidence: 0.9,
         };
         let empty = HashSet::new();
-        let res = extract_and_dedup(vec![cand], &empty);
+        let res = extract_and_dedup(vec![cand], &empty, "batch-test");
         let law = &res[0].laws[0];
         assert_eq!(law.law_name, "政府采购货物和服务招标投标管理办法");
         let meta = law.meta.as_ref().unwrap();
@@ -727,7 +734,7 @@ mod tests {
             confidence: 0.95,
         };
         let empty = HashSet::new();
-        let res = extract_and_dedup(vec![cand], &empty);
+        let res = extract_and_dedup(vec![cand], &empty, "batch-test");
         let d = &res[0];
 
         // Law: short_name 去掉"中华人民共和国"前缀
@@ -767,7 +774,7 @@ mod tests {
             confidence: 0.88,
         };
         let empty = HashSet::new();
-        let d = &extract_and_dedup(vec![cand], &empty)[0];
+        let d = &extract_and_dedup(vec![cand], &empty, "batch-test")[0];
 
         assert!(d.cases.is_empty(), "无案例引用时不应生成 Case 节点");
         assert_eq!(d.risk_experience.source_quote, "评分标准明显偏向特定品牌");
@@ -775,13 +782,58 @@ mod tests {
         assert_eq!(d.risk_experience.suggestion, "重新设计评分维度，去除品牌可识别属性");
         assert_eq!(d.risk_experience.confidence, 0.88);
         assert!(d.risk_experience.experience_id.starts_with("exp_"), "经验节点 ID 确定性生成");
-        // 同风险类型同候选 → experience_id 稳定（重投幂等）
+        // 同风险类型同候选、同文档 → experience_id 稳定（重投幂等）
         assert_eq!(
             d.risk_experience.experience_id,
-            gen_experience_id(&d.risk.id, "c3")
+            gen_experience_id(&d.risk.id, "c3", "batch-test")
         );
         // ProhibitionRule 为稳定禁止模式文案（非逐审核临时 reason）
         assert_eq!(d.rules[0].content, "禁止评分标准倾向类行为");
+    }
+
+    #[test]
+    fn test_experience_id_salted_by_batch_key() {
+        // 跨文档碰撞回归：同风险类型、同候选序号、不同文档（batch_key）→ experience_id 必不同
+        let mk = |candidate_id: String| Candidate {
+            candidate_id,
+            risk_id: "r".to_string(),
+            severity: "high".to_string(),
+            risk_type: "地域歧视".to_string(),
+            legal_basis: vec!["《政府采购法实施条例》第二十条".to_string()],
+            case_refs: vec![],
+            source_quote: "投标人必须有东莞常驻机构".to_string(),
+            reason: "地域限制".to_string(),
+            suggestion: "删除".to_string(),
+            confidence: 0.9,
+        };
+        let empty = HashSet::new();
+        // 场景：标书A、标书B 各审出同类型风险，且都落在会话内第 5 个（candidate_id=R_005）
+        let a = &extract_and_dedup(
+            vec![mk("R_005".to_string())],
+            &empty,
+            "doc-A.pdf",
+        )[0];
+        let b = &extract_and_dedup(
+            vec![mk("R_005".to_string())],
+            &empty,
+            "doc-B.pdf",
+        )[0];
+        assert_ne!(
+            a.risk_experience.experience_id,
+            b.risk_experience.experience_id,
+            "不同文档同类型同序号必须产出不同 experience_id，否则 MERGE 会静默吞掉第二次经验"
+        );
+        // 同文档重投 → 仍幂等
+        let a2 = &extract_and_dedup(
+            vec![mk("R_005".to_string())],
+            &empty,
+            "doc-A.pdf",
+        )[0];
+        assert_eq!(
+            a.risk_experience.experience_id,
+            a2.risk_experience.experience_id,
+            "同文档重投必须幂等"
+        );
     }
 
     #[test]
@@ -800,8 +852,16 @@ mod tests {
             confidence: 0.9,
         };
         let empty = HashSet::new();
-        let a = &extract_and_dedup(vec![mk("第一次不同的论证口径".to_string())], &empty)[0];
-        let b = &extract_and_dedup(vec![mk("第二次再次不同的论证口径".to_string())], &empty)[0];
+        let a = &extract_and_dedup(
+            vec![mk("第一次不同的论证口径".to_string())],
+            &empty,
+            "batch-test",
+        )[0];
+        let b = &extract_and_dedup(
+            vec![mk("第二次再次不同的论证口径".to_string())],
+            &empty,
+            "batch-test",
+        )[0];
         assert_eq!(a.rules[0].content, b.rules[0].content);
         assert_eq!(a.rules[0].rule_id, b.rules[0].rule_id, "content 稳定 → rule_id 稳定 → 跨审核归并");
         assert_eq!(a.rules[0].content, "禁止地域歧视类行为");
@@ -843,14 +903,14 @@ mod tests {
 
         // 空库 → New
         let empty = HashSet::new();
-        let res = extract_and_dedup(vec![cand.clone()], &empty);
+        let res = extract_and_dedup(vec![cand.clone()], &empty, "batch-test");
         assert_eq!(res[0].decision, Decision::New);
 
         // 库中已有 → Exists
         let law_id = gen_law_id("政府采购法实施条例");
         let mut existing = HashSet::new();
         existing.insert(law_id);
-        let res = extract_and_dedup(vec![cand], &existing);
+        let res = extract_and_dedup(vec![cand], &existing, "batch-test");
         assert_eq!(res[0].decision, Decision::Exists);
     }
 }

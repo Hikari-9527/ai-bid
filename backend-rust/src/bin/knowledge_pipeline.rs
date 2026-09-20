@@ -40,8 +40,12 @@ async fn main() -> Result<()> {
     println!("读取审核结果: {} 条发现 <- {}", findings.len(), path.display());
 
     let client = Neo4jClient::connect().await?;
-    let new_count = run(findings, &client).await?;
-    println!("整合流水线完成：新增 {} 条（已存在自动跳过）", new_count);
+    let batch_key = format!("bin/{}", path.file_stem().and_then(|s| s.to_str()).unwrap_or("pipeline"));
+    let outcome = run(findings, &client, &batch_key).await?;
+    println!(
+        "整合流水线完成：新增 {} 条（已存在自动跳过）",
+        outcome.new_count
+    );
 
     // 演示查询
     println!("\n=== 演示查询 ===");

@@ -50,6 +50,7 @@ impl AgentRegistry {
                 tool_names: &[
                     "web_search",
                     "search_knowledge_base",
+                    "search_graph_knowledge",
                     "search_document",
                     "read_section",
                     "output_finding",
@@ -241,7 +242,7 @@ impl AgentRegistry {
                 default_max_turns: 8,
                 complexity: AgentComplexity::Low,
                 section_keywords: &[], // Coordinator 按需调用，不参与路由
-tool_names: &["web_search", "search_knowledge_base", "search_document", "output_finding", "output_verification_batch"],
+tool_names: &["web_search", "search_knowledge_base", "search_graph_knowledge", "search_document", "output_finding", "output_verification_batch"],
             },
         );
 
@@ -450,6 +451,26 @@ mod tests {
         assert!(
             legal_verify.tool_names.contains(&"search_knowledge_base"),
             "LegalVerifyAgent 必须被授予 search_knowledge_base"
+        );
+    }
+
+    /// 图库经验检索工具（P0-3）权限授予集成测试：
+    /// 需要借鉴历史处置经验的 Agent（FactCheck / LegalVerify）
+    /// 必须被授予 search_graph_knowledge，否则图库沉淀再完美 Agent 也用不上。
+    #[test]
+    fn test_search_graph_knowledge_granted_to_relevant_agents() {
+        let registry = AgentRegistry::builtin();
+
+        let fact_check = registry.get(AgentId::FactCheck).unwrap();
+        assert!(
+            fact_check.tool_names.contains(&"search_graph_knowledge"),
+            "FactCheckAgent 必须被授予 search_graph_knowledge"
+        );
+
+        let legal_verify = registry.get(AgentId::LegalVerify).unwrap();
+        assert!(
+            legal_verify.tool_names.contains(&"search_graph_knowledge"),
+            "LegalVerifyAgent 必须被授予 search_graph_knowledge"
         );
     }
 
