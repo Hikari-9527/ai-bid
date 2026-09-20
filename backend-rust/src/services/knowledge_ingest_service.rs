@@ -8,7 +8,6 @@ use crate::domain::raw_document::RawDocument;
 use crate::domain::vector_index::DocumentVectorIndex;
 use crate::paths::data_path_str;
 use crate::services::chunking_service::{chunk_sections, populate_bbox_refs};
-use crate::services::docx_convert_service::convert_docx_to_pdf;
 use crate::services::pdf_extract_service::{extract_pdf_to_raw_json, extract_with_python};
 use crate::services::qdrant_store::{KnowledgePayload, QdrantStore, KB_COLLECTION, KB_VECTOR_DIM};
 use crate::services::sectionize_service::{self, Section};
@@ -136,13 +135,13 @@ fn prepare_ingest_blocking(
         .unwrap_or("pdf")
         .to_lowercase();
 
-    // ── 1. DOCX → PDF（可选）；转换产物用 guard 清理 ──
-    let pdf_path = if ext == "docx" || ext == "doc" {
-        convert_docx_to_pdf(&tmp_path_str, &tmp_dir).context("DOCX 转 PDF 失败")?
-    } else {
-        upload_path.clone()
-    };
-    let _pdf_guard = (pdf_path != upload_path).then(|| TempFileGuard::new(pdf_path.clone()));
+    // ── 1. 只接受 PDF：DOCX/DOC 必须由上游（Java 后端，全链路唯一 LibreOffice 转换点）转好再入库 ──
+    if ext == "docx" || ext == "doc" {
+        anyhow::bail!(
+            "Rust 引擎不再内置 DOCX→PDF 转换（镜像已移除 LibreOffice），请由 Java 侧先转换为 PDF 再入库"
+        );
+    }
+    let pdf_path = upload_path.clone();
     let pdf_path_str = pdf_path.to_str().unwrap_or(&tmp_path_str).to_string();
 
     // ── 2. PDF → RawDocument（Rust 主 + Python 兜底；fallback JSON 用 guard 清理）──
