@@ -242,17 +242,14 @@ impl AgentRegistry {
                 default_max_turns: 8,
                 complexity: AgentComplexity::Low,
                 section_keywords: &[], // Coordinator 按需调用，不参与路由
-<<<<<<< HEAD
-tool_names: &["web_search", "search_knowledge_base", "search_graph_knowledge", "search_document", "output_finding", "output_verification_batch"],
-=======
                 tool_names: &[
                     "web_search",
                     "search_knowledge_base",
                     "search_document",
+                    "search_graph_knowledge",
                     "output_finding",
                     "output_verification_batch",
                 ],
->>>>>>> f345762415b67aad15517fd738df291502177850
             },
         );
 
