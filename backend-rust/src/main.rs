@@ -1012,7 +1012,7 @@ async fn main() -> Result<()> {
             max_parallel,
             None,
             None,
-            "FactCheckAgent",
+            ai_bid::agents::types::AgentId::FactCheck,
             None,
         )
         .await;
